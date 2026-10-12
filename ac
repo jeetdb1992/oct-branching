@@ -1,0 +1,1197 @@
+1. Requirements
+Functional Requirements
+
+Users can receive notifications via:
+
+Email
+SMS
+Push Notifications
+In-App Notifications
+WhatsApp (optional)
+
+Examples:
+
+Order placed
+Payment successful
+Shipment delivered
+Password reset
+Promotional campaigns
+Non-Functional Requirements
+Highly scalable
+Highly available
+Low latency
+Reliable delivery
+Retry failed notifications
+Support millions of notifications/day
+Prevent duplicate notifications
+2. High-Level Architecture
+Plain Text
++------------------+
+| User Services |
+| Order/Payment etc|
++--------+---------+
+|
+|
+Notification Event
+|
+v
++----------------------+
+| Notification API |
++----------+-----------+
+|
+|
+v
+Kafka Topic
+notification-topic
+|
+------------------------------------------------
+| | | |
+v v v v
+Email Consumer SMS Consumer Push Consumer In-App Consumer
+| | | |
+v v v v
+Email Provider SMS Provider FCM/APNS Notification DB
+(SES, SendGrid) (Twilio etc)
+3. Components
+Notification Producer
+
+Order Service
+
+Java
+notificationProducer.send(
+NotificationEvent.builder()
+.userId(userId)
+.type("EMAIL")
+.template("ORDER_CREATED")
+.build()
+);
+
+Producer only publishes event.
+
+It does NOT send email.
+
+Kafka
+
+Acts as buffer.
+
+Benefits:
+
+Decoupling
+Back-pressure handling
+Replay capability
+Scalability
+
+Topics:
+
+Plain Text
+email-topic
+sms-topic
+push-topic
+
+or
+
+Plain Text
+notification-topic
+Notification Service
+
+Consumes notification events.
+
+Java
+@KafkaListener(topics="notification-topic")
+public void consume(NotificationEvent event) {
+process(event);
+}
+
+Responsibilities:
+
+Template selection
+Personalisation
+Provider selection
+Retry logic
+4. Database Design
+notification_request
+SQL
+CREATE TABLE notification_request(
+id BIGINT PRIMARY KEY,
+user_id BIGINT,
+channel VARCHAR(20),
+template_name VARCHAR(100),
+status VARCHAR(20),
+created_at TIMESTAMP
+);
+notification_delivery
+SQL
+CREATE TABLE notification_delivery(
+id BIGINT PRIMARY KEY,
+request_id BIGINT,
+provider VARCHAR(50),
+status VARCHAR(20),
+failure_reason TEXT,
+sent_at TIMESTAMP
+);
+5. Template Management
+
+Store templates centrally.
+
+SQL
+CREATE TABLE templates(
+id BIGINT,
+template_code VARCHAR(50),
+subject VARCHAR(200),
+body TEXT
+);
+
+Example:
+
+HTML
+Hello {{name}}
+ 
+Your order {{orderId}}
+has been shipped.
+
+At runtime:
+
+Java
+templateEngine.render(template, variables);
+
+Output:
+
+Plain Text
+Hello John
+ 
+Your order ORD123
+has been shipped.
+6. Channel Routing
+
+Event:
+
+JSON
+{
+"userId":101,
+"type":"ORDER_SHIPPED"
+}
+
+User preference:
+
+JSON
+{
+"email":true,
+"sms":true,
+"push":false
+}
+
+Notification Service decides:
+
+Plain Text
+Send Email
+Send SMS
+Skip Push
+7. Retry Mechanism
+
+Provider failure:
+
+Plain Text
+Kafka Consumer
+|
+|
+Send Email
+|
+Failure
+|
+Retry
+
+Using Spring Retry:
+
+Java
+@Retryable(
+value = Exception.class,
+maxAttempts = 3
+)
+public void sendEmail() {
+}
+8. Dead Letter Queue (DLQ)
+
+Even after retries:
+
+Plain Text
+Retry1 Failed
+Retry2 Failed
+Retry3 Failed
+
+Move to:
+
+Plain Text
+notification-dlq
+
+Flow:
+
+Plain Text
+Notification Topic
+|
+v
+Consumer
+|
+Failure
+|
+v
+Retry 3 times
+|
+v
+DLQ
+
+Operations team can inspect DLQ.
+
+9. Idempotency
+
+Kafka may deliver message more than once.
+
+Need duplicate protection.
+
+Notification event:
+
+JSON
+{
+"notificationId":"abc123"
+}
+
+Before sending:
+
+Java
+if(alreadyProcessed(id)) {
+return;
+}
+
+Database:
+
+SQL
+CREATE UNIQUE INDEX idx_notification_id
+ON notification_request(notification_id);
+
+Prevents double email/SMS.
+
+10. Rate Limiting
+
+Suppose marketing sends:
+
+Plain Text
+10 Million Emails
+
+Cannot flood provider.
+
+Using Redis Token Bucket:
+
+Plain Text
+1000 Emails/sec
+
+Only allowed rate is processed.
+
+Remaining stay in Kafka.
+
+11. Provider Failover
+
+Email provider down.
+
+Plain Text
+Primary:
+SendGrid
+
+Failure:
+
+Plain Text
+Fallback:
+AWS SES
+
+Flow:
+
+Plain Text
+Try SendGrid
+|
+Failure
+|
+Try SES
+Java
+try {
+sendGrid.send();
+}
+catch(Exception e) {
+ses.send();
+}
+12. Scaling
+Kafka Consumer Groups
+Plain Text
+Email Consumer-1
+Email Consumer-2
+Email Consumer-3
+Email Consumer-4
+
+Partitions:
+
+Plain Text
+P1
+P2
+P3
+P4
+
+Kafka distributes load automatically.
+
+Horizontal Scaling
+Plain Text
+Notification Service
+|
+-------------------
+| | | |
+N1 N2 N3 N4
+
+Add more nodes as traffic grows.
+
+13. Observability
+
+Metrics:
+
+Plain Text
+Notifications Sent
+Notifications Failed
+Retry Count
+DLQ Count
+Provider Latency
+
+Tools:
+
+Plain Text
+Prometheus
+Grafana
+ELK
+OpenTelemetry
+14. Production-Level Flow
+Plain Text
+Order Placed
+|
+v
+Order Service
+|
+Publish Event
+|
+v
+Kafka
+|
+v
+Notification Service
+|
++-------> User Preferences
+|
++-------> Template Engine
+|
++-------> Email Topic
+|
++-------> SMS Topic
+|
++-------> Push Topic
+|
+v
+Channel Consumer
+|
+v
+Provider
+|
+v
+Status Update DB
+Interview Answer (2-Minute Version)
+
+"I would design the notification system using an event-driven architecture. Business services such as Order Service or Payment Service publish notification events to Kafka. A Notification Service consumes these events, checks user preferences, resolves templates, and routes notifications to Email, SMS, Push, or In-App channels. Each channel has dedicated consumers for independent scaling. Failed deliveries are retried using Spring Retry and moved to a DLQ after max retry attempts. Idempotency is ensured using a unique notification ID. Redis-based rate limiting protects third-party providers. Kafka consumer groups allow horizontal scaling, while provider failover ensures high availability. Metrics are collected through Prometheus and Grafana for monitoring."
+
+This is typically the level expected from a senior backend engineer/system design interview.
+
+Provide your feedback on BizChat
+You said:
+as I java developer with 11.3 years of experience what CI/CD related question can I face in interviwew
+Copilot said:
+
+For a Java Developer with 11.3 years of experience, interviewers usually expect you to know not only what CI/CD is, but also how you have implemented it in real projects, handled production deployments, rollbacks, quality gates, containerisation, Kubernetes, and DevOps practices.
+
+Here are the most common CI/CD interview questions.
+
+1. What is CI/CD?
+CI (Continuous Integration)
+
+Developers frequently merge code into a shared repository.
+
+Pipeline automatically:
+
+Builds code
+Runs unit tests
+Runs code quality checks
+CD (Continuous Delivery/Deployment)
+
+Automatically deploys validated code to environments.
+
+Plain Text
+Developer
+|
+Git Commit
+|
+Jenkins/GitHub Actions
+|
+Build
+|
+Unit Test
+|
+Code Scan
+|
+Docker Build
+|
+Deploy
+ 
+2. Explain the CI/CD Pipeline used in your project
+
+A good senior-level answer:
+
+Plain Text
+Developer commits code to Git.
+ 
+↓
+ 
+Jenkins pipeline triggers automatically.
+ 
+↓
+ 
+Maven build executes.
+ 
+↓
+ 
+JUnit test cases run.
+ 
+↓
+ 
+SonarQube performs code quality scanning.
+ 
+↓
+ 
+Docker image created.
+ 
+↓
+ 
+Image pushed to Nexus/Artifactory/Docker Hub.
+ 
+↓
+ 
+Deployment to Kubernetes Dev cluster.
+ 
+↓
+ 
+Smoke test executed.
+ 
+↓
+ 
+Promote to QA/UAT.
+ 
+↓
+ 
+Production deployment.
+3. Difference Between Continuous Delivery and Continuous Deployment
+Continuous Delivery
+
+Production deployment requires manual approval.
+
+Plain Text
+Build
+↓
+QA
+↓
+UAT
+↓
+Manual Approval
+↓
+Production
+Continuous Deployment
+
+No manual intervention.
+
+Plain Text
+Build
+↓
+Test
+↓
+Deploy Production
+4. What happens when you commit code?
+
+Expected answer:
+
+Plain Text
+Git Commit
+ 
+↓
+ 
+Webhook
+ 
+↓
+ 
+Jenkins Trigger
+ 
+↓
+ 
+Checkout Code
+ 
+↓
+ 
+Maven Clean Install
+ 
+↓
+ 
+JUnit Tests
+ 
+↓
+ 
+SonarQube Scan
+ 
+↓
+ 
+Package Jar
+ 
+↓
+ 
+Docker Build
+ 
+↓
+ 
+Push Image
+ 
+↓
+ 
+Deploy
+5. Explain Jenkins Pipeline
+
+Example:
+
+Groovy
+pipeline {
+ 
+agent any
+ 
+stages {
+ 
+stage('Build') {
+steps {
+sh 'mvn clean install'
+}
+}
+ 
+stage('Test') {
+steps {
+sh 'mvn test'
+}
+}
+ 
+stage('Sonar') {
+steps {
+sh 'mvn sonar:sonar'
+}
+}
+ 
+stage('Docker') {
+steps {
+sh 'docker build -t app .'
+}
+}
+ 
+}
+}
+
+Interviewers often ask:
+
+What stages do you have in Jenkins?
+
+6. What is SonarQube?
+
+Static code analysis tool.
+
+Detects:
+
+Bugs
+Vulnerabilities
+Code smells
+Test coverage
+
+Example:
+
+Plain Text
+Coverage = 82%
+ 
+Bug = 5
+ 
+Critical Vulnerability = 0
+ 
+
+Pipeline can fail if quality gate fails.
+
+7. What is a Quality Gate?
+
+Example:
+
+Plain Text
+Coverage > 80%
+ 
+No Critical Vulnerabilities
+ 
+No Blocker Bugs
+
+If violated:
+
+Plain Text
+Build Failed
+ 
+8. How do you deploy a Spring Boot Application?
+
+Traditional:
+
+Shell
+java -jar app.jar
+ 
+
+Containerised:
+
+Shell
+docker build -t order-service .
+docker run order-service
+
+Kubernetes:
+
+Shell
+kubectl apply -f deployment.yaml
+9. How do you rollback a failed deployment?
+Kubernetes
+Shell
+kubectl rollout undo deployment/order-service
+Strategy
+Plain Text
+New Version Failed
+ 
+↓
+ 
+Rollback to Previous Stable Version
+
+Very commonly asked.
+
+10. Blue-Green Deployment
+
+Two environments.
+
+Plain Text
+Blue -> Production
+ 
+Green -> New Version
+`
+
+Flow:
+
+Plain Text
+Users
+|
+Blue Environment
+ 
+Deploy to Green
+ 
+Test Green
+ 
+Switch Traffic
+
+Benefit:
+
+Plain Text
+Zero Downtime
+11. Canary Deployment
+
+Deploy to small percentage first.
+
+Plain Text
+Version 1 --> 95%
+ 
+Version 2 --> 5%
+
+Monitor.
+
+If stable:
+
+Plain Text
+50%
+ 
+↓
+ 
+100%
+12. What is Docker's Role in CI/CD?
+
+Without Docker:
+
+Plain Text
+Works on My Machine
+``
+
+With Docker:
+
+Plain Text
+Same Runtime Everywhere
+
+Pipeline:
+
+Plain Text
+Build Jar
+|
+Create Docker Image
+|
+Push Registry
+|
+Deploy
+13. Difference Between Docker and Kubernetes
+
+Docker:
+
+Plain Text
+Container Platform
+
+Kubernetes:
+
+Plain Text
+Container Orchestration Platform
+`
+
+Kubernetes manages:
+
+Scaling
+Self-healing
+Deployment
+Rollback
+14. How do you manage application.properties across environments?
+
+Never hardcode.
+
+Example:
+
+Plain Text
+application-dev.yml
+ 
+application-qa.yml
+ 
+application-prod.yml
+
+Deployment:
+
+Shell
+-Dspring.profiles.active=prod
+
+Or ConfigMaps/Secrets in Kubernetes.
+
+15. How are Secrets Managed?
+
+Bad:
+
+YAML
+password=admin123
+
+Good:
+
+Plain Text
+Kubernetes Secrets
+ 
+AWS Secrets Manager
+ 
+HashiCorp Vault
+16. What is Nexus/Artifactory?
+
+Artifact Repository.
+
+Stores:
+
+Plain Text
+JAR Files
+ 
+Docker Images
+ 
+Libraries
+``
+
+Flow:
+
+Plain Text
+Build
+|
+Jar Generated
+|
+Stored in Nexus
+|
+Deployment Fetches Jar
+17. What tests run in CI Pipeline?
+Unit Tests
+Java
+JUnit
+Mockito
+Integration Tests
+Plain Text
+Database
+Kafka
+Redis
+Smoke Tests
+
+Basic validation after deployment.
+
+18. How do you handle database changes in CI/CD?
+
+Tools:
+
+Plain Text
+Flyway
+ 
+Liquibase
+
+Example:
+
+SQL
+V1__create_user.sql
+ 
+V2__add_email.sql
+
+Executed automatically during deployment.
+
+19. How do you deploy Microservices independently?
+
+Each service has:
+
+Plain Text
+Own Repository
+ 
+Own Pipeline
+ 
+Own Docker Image
+ 
+Own Kubernetes Deployment
+`
+
+Example:
+
+Plain Text
+Order Service → Deploy
+ 
+Inventory Service → No Impact
+ 
+Payment Service → No Impact
+20. Scenario-Based Question
+Pipeline succeeds but Production deployment fails. What will you do?
+
+Expected answer:
+
+Plain Text
+1. Check Jenkins logs.
+ 
+2. Check Kubernetes events.
+ 
+3. Check pod logs.
+ 
+4. Verify ConfigMaps and Secrets.
+ 
+5. Rollback immediately if service impact exists.
+ 
+6. Fix issue and redeploy.
+Critical CI/CD Questions for 10+ Years Experience
+
+These are asked most frequently:
+
+Q1. Explain your complete CI/CD pipeline.
+Q2. How do you perform rollback?
+Q3. Blue-Green vs Canary deployment.
+Q4. How do you manage secrets?
+Q5. How do you handle database migrations?
+Q6. What quality gates do you use in SonarQube?
+Q7. How do you deploy Spring Boot applications to Kubernetes?
+Q8. How do you reduce deployment downtime?
+Q9. How do you handle failed deployments?
+Q10. Explain Docker image creation and deployment flow.
+Q11. How do you automate testing in CI/CD?
+Q12. Explain a production deployment issue you handled.
+
+For an 11.3-year Java developer, interviewers often focus heavily on real-world scenario questions rather than definitions. They may ask things like:
+
+"A deployment succeeded but pods are crashing. How do you troubleshoot?"
+
+"A Flyway script succeeded in QA but failed in production. What would you do?"
+
+"How would you deploy a new version of payment-service without affecting ongoing transactions?"
+
+These scenario-based answers usually differentiate senior engineers from mid-level developers.
+
+Provide your feedback on BizChat
+You said:
+do I have to memorize anything here or is it all following of steps and executing
+Copilot said:
+
+Honestly, for an 11.3-year Senior Java Developer interview, you do not need to memorise Jenkins syntax, kubectl commands, or every CI/CD tool feature.
+
+What you must remember is the flow, reasoning, and troubleshooting approach.
+
+What you should know by heart
+1. Complete CI/CD Flow
+Plain Text
+Developer Commit
+↓
+Git
+↓
+Jenkins Trigger
+↓
+Maven Build
+↓
+Unit Tests
+↓
+SonarQube Scan
+↓
+Package JAR
+↓
+Docker Build
+↓
+Push to Registry
+↓
+Deploy to Kubernetes
+↓
+Smoke Test
+
+If someone wakes you up at 2 AM, you should be able to explain this flow.
+
+2. Purpose of Each Step
+
+Don't memorise commands.
+
+Memorise:
+
+Step	WhyBuild	Verify code compiles
+Unit Test	Catch bugs early
+SonarQube	Ensure code quality
+Docker	Consistent runtime
+Registry	Store images
+Kubernetes	Deploy and scale
+Smoke Test	Verify deployment
+
+Interviewers care more about the why than the exact command.
+
+3. Deployment Strategies
+
+You should know:
+
+Plain Text
+Rolling Deployment
+Blue-Green Deployment
+Canary Deployment
+
+And when to use each.
+
+Example:
+
+Q: Why Canary?
+
+Answer:
+
+To release to a small percentage of users first, monitor errors, and gradually increase traffic before exposing all users.
+
+That's enough.
+
+4. Rollback Strategy
+
+Interviewers love this.
+
+Remember:
+
+Plain Text
+Deploy
+↓
+Issue Found
+↓
+Rollback
+↓
+Investigate
+↓
+Fix
+↓
+Redeploy
+5. Database Changes
+
+Remember:
+
+Plain Text
+Flyway
+Liquibase
+
+Concept:
+
+Plain Text
+Versioned Scripts
+ 
+V1__Create_User.sql
+ 
+V2__Add_Email.sql
+
+Why?
+
+To keep schema changes consistent across environments.
+
+What you DON'T need to memorise
+
+❌ Exact Jenkinsfile syntax
+
+❌ Every Docker command
+
+❌ Every Kubernetes YAML field
+
+❌ SonarQube configuration
+
+❌ Flyway configuration properties
+
+At your level, nobody expects:
+
+Groovy
+pipeline {
+agent any
+}
+
+from memory.
+
+What interviewers REALLY check for at 11+ years
+
+They ask situations.
+
+Example 1:
+
+Deployment succeeded but application is down. What will you do?
+
+Expected thinking:
+
+Plain Text
+Check Pod Status
+ 
+↓
+ 
+Check Kubernetes Events
+ 
+↓
+ 
+Check Application Logs
+ 
+↓
+ 
+Check ConfigMaps/Secrets
+ 
+↓
+ 
+Rollback if required
+
+Example 2:
+
+New deployment causes memory leak.
+
+Answer:
+
+Plain Text
+Rollback immediately.
+ 
+Analyze heap dump.
+ 
+Identify leak.
+ 
+Fix.
+ 
+Deploy again.
+
+Example 3:
+
+SonarQube quality gate failed.
+
+Answer:
+
+Plain Text
+Inspect the report.
+ 
+Fix critical vulnerabilities.
+ 
+Increase test coverage.
+ 
+Rebuild pipeline.
+For your experience level
+
+I'd focus on remembering just 10 concepts:
+
+CI vs CD
+Jenkins pipeline flow
+Git workflow
+SonarQube & Quality Gates
+Docker
+Kubernetes
+Rolling deployment
+Blue-Green deployment
+Canary deployment
+Rollback strategy
+
+If you understand these deeply, you can answer 80-90% of CI/CD interview questions without memorising commands.
+
+A senior interviewer is usually looking for:
+
+"Can this person safely deploy a critical banking/payment microservice to production and recover quickly if something goes wrong?"
+
+That's far more important than remembering a Jenkins command.
+
+Provide your feedback on BizChat
+You said:
+If a student studies NCERT books properly how well can he score in CBSE 10
+Copilot said:
+
+If a student studies NCERT books thoroughly, they can score very high in CBSE Class 10, even 95%+ and potentially 98-100% in some subjects.
+
+The reason is simple:
+
+✅ Most CBSE board questions are directly based on NCERT concepts.
+ ✅ Science and Mathematics questions are largely derived from NCERT exercises and examples.
+ ✅ Social Science answers come primarily from NCERT content.
+ ✅ English and Hindi literature questions are based on the prescribed NCERT texts.
+
+A realistic estimate
+Preparation Level	Expected ScoreReads NCERT casually	70-80%
+Studies NCERT properly and solves all exercises	85-95%
+Masters NCERT + solves sample papers and previous years' questions	95-99%+
+What "studying NCERT properly" means
+
+For Mathematics:
+
+Solve every example.
+Solve every exercise.
+Rework difficult questions multiple times.
+
+For Science:
+
+Understand concepts, not just memorise.
+Learn diagrams and activities.
+Solve all back-exercise questions.
+
+For Social Science:
+
+Read chapters multiple times.
+Make short notes of important points.
+Practise map work.
+
+For Languages:
+
+Read all chapters.
+Practise writing skills (letters, articles, reports).
+Learn formats.
+A common misconception
+
+Many students buy 5-10 reference books and ignore NCERT.
+
+Top-performing students often do this instead:
+
+Plain Text
+NCERT
+↓
+NCERT Exercises
+↓
+Sample Papers
+↓
+Previous Year Questions
+
+They build a very strong foundation from NCERT first.
+
+My advice
+
+If a Class 10 student completes NCERT 3-4 times thoroughly, solves all exercises, and practises CBSE sample papers, scoring 90%+ is very realistic, and 95%+ is absolutely achievable for most diligent students. The difference between 95% and 99% usually comes from exam practice, presentation, and avoiding silly mistakes rather than studying extra books.
